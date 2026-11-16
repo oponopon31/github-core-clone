@@ -304,7 +304,10 @@ interface FetchSelection {
   objects: PackObject[];
   shallow: string[];
   unshallow: string[];
+  /** The first have that is an ancestor-or-equal of a want (v0's ACK). */
   ack: string | null;
+  /** Every have that is an ancestor-or-equal of a want, in request order. */
+  acks: string[];
 }
 
 /**
@@ -440,7 +443,8 @@ function selectFetch(
       if (target) ancestorStack.push(target.object);
     }
   }
-  const ack = haves.find((have) => ancestors.has(have)) ?? null;
+  const acks = haves.filter((have) => ancestors.has(have));
+  const ack = acks[0] ?? null;
 
   const shallow: string[] = [];
   const unshallow: string[] = [];
@@ -462,7 +466,7 @@ function selectFetch(
     objects.push({ sha, type: object.type, body: object.body });
   }
   objects.sort((a, b) => (a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0));
-  return { objects, shallow, unshallow, ack };
+  return { objects, shallow, unshallow, ack, acks };
 }
 
 function packForFetch(
@@ -472,6 +476,7 @@ function packForFetch(
   shallowIn: string[],
   depth: number | undefined,
   selection: FetchSelection,
+  includeTag: boolean,
 ): Buffer {
   const key = [
     rc.owner,
@@ -480,6 +485,7 @@ function packForFetch(
     `depth=${depth ?? ''}`,
     [...haves].sort().join(','),
     [...shallowIn].sort().join(','),
+    `include-tag=${includeTag ? '1' : '0'}`,
   ].join('|');
   const hit = packCache.get(key);
   if (hit) return hit;
@@ -606,6 +612,12 @@ interface FetchArgs {
   haves: string[];
   shallow: string[];
   depth: number | undefined;
+  /** The client sent `done`: negotiation is over. */
+  done: boolean;
+  /** The client sent `include-tag`: also send tags pointing at wanted commits. */
+  includeTag: boolean;
+  /** The client sent `deepen-relative`: `deepen` adds to the current depth. */
+  deepenRelative: boolean;
 }
 
 function parseFetchArgs(lines: readonly string[]): FetchArgs {
@@ -613,6 +625,9 @@ function parseFetchArgs(lines: readonly string[]): FetchArgs {
   const haves: string[] = [];
   const shallow: string[] = [];
   let depth: number | undefined;
+  let done = false;
+  let includeTag = false;
+  let deepenRelative = false;
   const seenWant = new Set<string>();
   for (const raw of lines) {
     const line = raw.replace(/\n$/, '');
@@ -630,12 +645,18 @@ function parseFetchArgs(lines: readonly string[]): FetchArgs {
     } else if (line.startsWith('deepen ')) {
       const value = Number.parseInt(line.slice(7).trim(), 10);
       if (Number.isFinite(value) && value > 0) depth = value;
+    } else if (line === 'done') {
+      done = true;
+    } else if (line === 'include-tag') {
+      includeTag = true;
+    } else if (line === 'deepen-relative') {
+      deepenRelative = true;
     }
     // thin-pack, no-progress, ofs-delta, filter, deepen-since, deepen-not,
-    // agent, object-format, done: accepted and (where they carry no
-    // selection meaning) ignored.
+    // agent, object-format: accepted and (where they carry no selection
+    // meaning) ignored.
   }
-  return { wants, haves, shallow, depth };
+  return { wants, haves, shallow, depth, done, includeTag, deepenRelative };
 }
 
 function lsRefsResponse(rc: RepoCtx, lines: readonly string[], res: ServerResponse): void {
@@ -701,20 +722,98 @@ function lsRefsResponse(rc: RepoCtx, lines: readonly string[], res: ServerRespon
   sendBuffer(res, 200, UPLOAD_RESULT, Buffer.concat(parts));
 }
 
+/**
+ * The absolute depth a fetch delivers at. An absolute `deepen N` is used
+ * as-is. With `deepen-relative` (real git's `--deepen`), N adds to the
+ * current depth of each shallow boundary: a boundary at distance d from a
+ * want sat at depth d+1, so the new depth is d+1+N (the largest over all
+ * reachable boundaries; with no reachable boundary, N as-is).
+ */
+function resolveDepth(rc: RepoCtx, args: FetchArgs): number | undefined {
+  if (args.depth === undefined) return undefined;
+  if (!args.deepenRelative) return args.depth;
+  const distances = new Map<string, number>();
+  const queue: Array<{ oid: string; dist: number }> = args.wants.map((oid) => ({ oid, dist: 0 }));
+  const seenTags = new Set<string>();
+  for (let head = 0; head < queue.length; head += 1) {
+    const { oid, dist } = queue[head] as { oid: string; dist: number };
+    const object = readStored(rc, oid);
+    if (!object) continue;
+    if (object.type === 'tag') {
+      if (seenTags.has(oid)) continue;
+      seenTags.add(oid);
+      const target = parseTagTarget(object.body);
+      if (target) queue.push({ oid: target.object, dist });
+      continue;
+    }
+    if (object.type !== 'commit') continue;
+    const previous = distances.get(oid);
+    if (previous !== undefined && previous <= dist) continue;
+    distances.set(oid, dist);
+    for (const parent of parseCommit(object.body).parents) {
+      queue.push({ oid: parent, dist: dist + 1 });
+    }
+  }
+  let best: number | undefined;
+  for (const boundary of args.shallow) {
+    const dist = distances.get(boundary);
+    if (dist === undefined) continue;
+    const total = dist + 1 + args.depth;
+    if (best === undefined || total > best) best = total;
+  }
+  return best ?? args.depth;
+}
+
 function fetchV2Response(rc: RepoCtx, args: FetchArgs, res: ServerResponse): void {
   for (const want of args.wants) {
     if (!rc.git.hasObject(rc.owner, rc.repo, want)) {
       throw new HttpError(400, `want ${want} is not known`);
     }
   }
-  const selection = selectFetch(rc, args.wants, args.haves, args.shallow, args.depth);
+  const depth = resolveDepth(rc, args);
+  let selection = selectFetch(rc, args.wants, args.haves, args.shallow, depth);
+  if (args.includeTag) {
+    // Also send annotated tags pointing at a delivered commit.
+    const delivered = new Set(selection.objects.map((object) => object.sha));
+    const extra: PackObject[] = [];
+    for (const ref of sortedRefs(rc)) {
+      if (!ref.name.startsWith('refs/tags/')) continue;
+      const object = readStored(rc, ref.sha);
+      if (!object || object.type !== 'tag') continue;
+      const target = peelTarget(rc, ref.sha);
+      if (target && delivered.has(target) && !delivered.has(ref.sha)) {
+        extra.push({ sha: ref.sha, type: 'tag', body: object.body });
+        delivered.add(ref.sha);
+      }
+    }
+    if (extra.length) {
+      selection = {
+        ...selection,
+        objects: [...selection.objects, ...extra].sort((a, b) =>
+          a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0,
+        ),
+      };
+    }
+  }
   const pack = args.wants.length
-    ? packForFetch(rc, args.wants, args.haves, args.shallow, args.depth, selection)
+    ? packForFetch(rc, args.wants, args.haves, args.shallow, depth, selection, args.includeTag)
     : emptyPack();
   const parts: Buffer[] = [];
-  parts.push(encodePktLine('acknowledgments\n'));
-  parts.push(encodePktLine(selection.ack ? `ACK ${selection.ack}\n` : 'NAK\n'));
-  parts.push(encodeDelim());
+  // The acknowledgments section exists only while negotiation is open.
+  // A request carrying `done` goes straight to the pack (real git expects
+  // the first section to be shallow-info, wanted-refs or packfile); without
+  // `done`, ACK every matching have (plus `ready`) or NAK, then the pack
+  // follows in this same response.
+  if (!args.done) {
+    parts.push(encodePktLine('acknowledgments\n'));
+    if (selection.acks.length) {
+      for (const sha of selection.acks) parts.push(encodePktLine(`ACK ${sha}\n`));
+      parts.push(encodePktLine('ready\n'));
+    } else {
+      parts.push(encodePktLine('NAK\n'));
+    }
+    parts.push(encodeDelim());
+  }
   if (selection.shallow.length || selection.unshallow.length) {
     parts.push(encodePktLine('shallow-info\n'));
     for (const sha of selection.shallow) parts.push(encodePktLine(`shallow ${sha}\n`));
@@ -739,9 +838,10 @@ function fetchV0Response(rc: RepoCtx, args: FetchArgs, res: ServerResponse): voi
       throw new HttpError(400, `want ${want} is not known`);
     }
   }
-  const selection = selectFetch(rc, args.wants, args.haves, args.shallow, args.depth);
+  const depth = resolveDepth(rc, args);
+  const selection = selectFetch(rc, args.wants, args.haves, args.shallow, depth);
   const pack = args.wants.length
-    ? packForFetch(rc, args.wants, args.haves, args.shallow, args.depth, selection)
+    ? packForFetch(rc, args.wants, args.haves, args.shallow, depth, selection, args.includeTag)
     : emptyPack();
   const parts: Buffer[] = [];
   parts.push(encodePktLine(selection.ack ? `ACK ${selection.ack}\n` : 'NAK\n'));
@@ -1025,8 +1125,12 @@ export function handleReceivePack(
       );
     }
     const inner = encodePktLines(reportLines.map((line) => `${line}\n`));
+    // With side-band-64k the report stream inside band 1 is itself
+    // pkt-lined and ends with a flush packet (git's own receive-pack does
+    // this); the outer stream ends with a flush too. Without sideband the
+    // report stream is the body and its trailing flush ends it.
     const response = sideband
-      ? Buffer.concat([encodeSideband(1, inner), encodeFlush()])
+      ? Buffer.concat([encodeSideband(1, Buffer.concat([inner, encodeFlush()])), encodeFlush()])
       : Buffer.concat([inner, encodeFlush()]);
     sendBuffer(res, 200, RECEIVE_RESULT, response);
   } catch (err) {

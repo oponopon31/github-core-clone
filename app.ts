@@ -6,6 +6,9 @@
 // GET /healthz requires `Authorization: Bearer <MAKEFUN_SHOP_TOKEN>` exactly.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { LogicalClock } from './clock.ts';
 import { GitStore } from './gitmodel.ts';
 import { handleGraphql } from './graphql.ts';
@@ -35,7 +38,11 @@ function decodeSegment(segment: string): string | null {
 }
 
 export function createApp(): Server {
-  const dataDir = process.env.FORGE_DATA_DIR ?? '/tmp/forge-data';
+  // A fresh store per process: each trial pass (live, replay) runs its own
+  // process, and a replay must start from an empty store — sharing a data dir
+  // across passes would resurrect the live pass's repos. An explicit
+  // FORGE_DATA_DIR still wins (local tests that rely on restart-restore).
+  const dataDir = process.env.FORGE_DATA_DIR ?? mkdtempSync(join(tmpdir(), 'forge-data-'));
   const clock = new LogicalClock(process.env.MAKEFUN_TRIAL_NOW);
   const store = new Store(dataDir, clock);
   store.loadSnapshot();
