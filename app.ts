@@ -44,7 +44,9 @@ export function createApp(): Server {
   // FORGE_DATA_DIR still wins (local tests that rely on restart-restore).
   const dataDir = process.env.FORGE_DATA_DIR ?? mkdtempSync(join(tmpdir(), 'forge-data-'));
   const clock = new LogicalClock(process.env.MAKEFUN_TRIAL_NOW);
-  const store = new Store(dataDir, clock);
+  // Snapshot persistence only when the operator chose an explicit data dir;
+  // a trial's temp dir is never re-read, so skip the per-mutation snapshot.
+  const store = new Store(dataDir, clock, process.env.FORGE_DATA_DIR !== undefined);
   store.loadSnapshot();
   const git = new GitStore(dataDir, clock);
   const ctx: ForgeContext = {

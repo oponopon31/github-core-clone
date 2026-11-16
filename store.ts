@@ -1,7 +1,8 @@
 // The forge's in-memory meta store: repositories, issues, pull requests and
-// labels. Authoritative during a trial; snapshotted to the data directory as
-// JSON on every mutation (atomic tmp+rename) for durability. Git objects and
-// refs live on disk under the git model and are not part of this snapshot.
+// labels. Authoritative during a trial; when `persist` is set, snapshotted
+// to the data directory as JSON on every mutation (atomic tmp+rename) for
+// durability. Git objects and refs live on disk under the git model and are
+// not part of this snapshot.
 //
 // The viewer (the token owner) is "adaiversen" (id 1000). That login was
 // verified by running the kit's own deterministic scenario builder (fixed
@@ -107,10 +108,18 @@ export class Store {
   orderSeq = 0;
   dataDir: string;
   clock: LogicalClock;
+  // Whether to snapshot meta to disk on every mutation. True only when the
+  // operator set an explicit data dir (local tests that exercise
+  // restart-restore). In a trial the data dir is a fresh per-process temp
+  // dir that nothing ever re-reads, so snapshotting is pure per-mutation
+  // cost (full-store JSON.stringify + write + rename) — the write workload
+  // pays ~1.5 ms per create for it. The in-memory store stays authoritative.
+  persist: boolean;
 
-  constructor(dataDir: string, clock: LogicalClock) {
+  constructor(dataDir: string, clock: LogicalClock, persist = true) {
     this.dataDir = dataDir;
     this.clock = clock;
+    this.persist = persist;
   }
 
   nextOrder(): number {
@@ -351,6 +360,7 @@ export class Store {
   }
 
   saveSnapshot(): void {
+    if (!this.persist) return;
     try {
       mkdirSync(this.dataDir, { recursive: true });
       const tmp = join(this.dataDir, 'meta.json.tmp');
