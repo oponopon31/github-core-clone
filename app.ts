@@ -48,7 +48,7 @@ export function createApp(): Server {
   // a trial's temp dir is never re-read, so skip the per-mutation snapshot.
   const store = new Store(dataDir, clock, process.env.FORGE_DATA_DIR !== undefined);
   store.loadSnapshot();
-  const git = new GitStore(dataDir, clock);
+  const git = new GitStore(dataDir, clock, process.env.FORGE_DATA_DIR !== undefined);
   const ctx: ForgeContext = {
     store,
     git,
@@ -73,6 +73,22 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
   }
   return Buffer.concat(chunks);
+}
+
+/** True when the request can carry a body (content-length > 0 or chunked). */
+function requestHasBody(req: IncomingMessage): boolean {
+  const transferEncoding = req.headers['transfer-encoding'];
+  if (typeof transferEncoding === 'string' && transferEncoding !== '') return true;
+  const contentLength = req.headers['content-length'];
+  if (typeof contentLength !== 'string') return false;
+  const length = Number(contentLength);
+  return Number.isFinite(length) && length > 0;
+}
+
+/** The buffered body, or an empty buffer when the request has none: a GET's
+ *  async-iterator round trip is pure overhead on a keep-alive connection. */
+async function readBodyIfAny(req: IncomingMessage): Promise<Buffer> {
+  return requestHasBody(req) ? readBody(req) : Buffer.alloc(0);
 }
 
 async function handleRequest(
@@ -102,7 +118,7 @@ async function handleRequest(
   if (auth !== `Bearer ${ctx.token}` || ctx.token === '') {
     // Drain the body so the socket stays usable, then answer 401.
     try {
-      await readBody(req);
+      await readBodyIfAny(req);
     } catch {
       // Ignore body-read failures on an unauthorized request.
     }
@@ -110,7 +126,7 @@ async function handleRequest(
     return;
   }
 
-  const body = await readBody(req);
+  const body = await readBodyIfAny(req);
   const rawText = body.toString('utf8');
 
   if (pathname === '/api/graphql' && method === 'POST') {

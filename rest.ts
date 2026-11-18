@@ -215,10 +215,13 @@ function dispatchRepo(
         return true;
       }
       ctx.store.deleteRepo(repo);
-      try {
-        rmSync(ctx.git.gitDir(owner, name), { recursive: true, force: true });
-      } catch {
-        // Best effort.
+      ctx.git.dropRepo(owner, name);
+      if (ctx.git.persist) {
+        try {
+          rmSync(ctx.git.gitDir(owner, name), { recursive: true, force: true });
+        } catch {
+          // Best effort.
+        }
       }
       sendJson(res, 204, null);
       return true;

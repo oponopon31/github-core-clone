@@ -9,7 +9,7 @@
 // All hashes are SHA-1, as git's classic object format requires.
 
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { dirname, join } from 'node:path';
 import type { LogicalClock } from './clock.ts';
@@ -66,6 +66,17 @@ function isBinary(body: Buffer): boolean {
   return body.includes(0);
 }
 
+/** The parent shas of a commit body, in order (no other field is read). */
+function parseCommitParents(body: Buffer): string[] {
+  const blank = body.indexOf('\n\n');
+  const header = blank < 0 ? body.toString('utf8') : body.subarray(0, blank).toString('utf8');
+  const parents: string[] = [];
+  for (const line of header.split('\n')) {
+    if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
+  }
+  return parents;
+}
+
 /** LCS-based line diff; returns [additions, deletions]. */
 function lineDiff(oldText: string, newText: string): [number, number] {
   const a = splitLines(oldText);
@@ -107,12 +118,38 @@ export class GitStore {
   dataDir: string;
   clock: LogicalClock;
   // Immutable objects are safe to cache: a sha always names the same bytes.
-  // Capped and cleared wholesale when full, so memory stays bounded.
+  // Capped and cleared wholesale when full, so memory stays bounded — but
+  // only when `persist` is set: in trial mode the disk is never written, so
+  // the cache IS the store and clearing it would lose objects.
   objectCache: Map<string, GitObject> = new Map();
+  // Commit parents, memoized: the fast-forward walk re-parses every commit
+  // body it visits, so a 600-commit chain costs ~600 parses per push.
+  parentCache: Map<string, string[]> = new Map();
+  // Refs, cached in memory: every info/refs, ls-refs, getRef and listRefs
+  // otherwise re-reads the ref files from disk. The map is authoritative
+  // in trial mode and a read-through cache when `persist` is set; every
+  // mutation goes through updateRef/deleteRef/dropRepo, so it cannot go
+  // stale. refsLoaded marks repos whose map was initialized (from disk when
+  // persisting, empty otherwise).
+  refCache: Map<string, Map<string, string>> = new Map();
+  refsLoaded: Set<string> = new Set();
+  /** Bumped on every ref mutation; part of the fetch-selection cache key. */
+  refsGeneration = 0;
+  // Object subdirectories already created this process (skip repeated
+  // recursive mkdirSync), and repos whose git dir was already ensured.
+  objectDirs: Set<string> = new Set();
+  ensuredRepos: Set<string> = new Set();
+  // Whether git state is durable on disk. False only when the operator did
+  // not set an explicit data dir — a trial's temp dir is never re-read, so
+  // in that mode the in-memory caches are authoritative and no object or
+  // ref ever touches the disk (the Store uses the same rule for its
+  // snapshot). Restart-restore local tests set FORGE_DATA_DIR and persist.
+  persist: boolean;
 
-  constructor(dataDir: string, clock: LogicalClock) {
+  constructor(dataDir: string, clock: LogicalClock, persist = true) {
     this.dataDir = dataDir;
     this.clock = clock;
+    this.persist = persist;
   }
 
   gitDir(owner: string, repo: string): string {
@@ -120,11 +157,33 @@ export class GitStore {
   }
 
   ensureRepo(owner: string, repo: string): void {
+    const key = `${owner}/${repo}`;
+    if (this.ensuredRepos.has(key)) return;
+    this.ensuredRepos.add(key);
+    if (!this.persist) return;
     const dir = this.gitDir(owner, repo);
     mkdirSync(join(dir, 'objects'), { recursive: true });
     mkdirSync(join(dir, 'refs', 'heads'), { recursive: true });
     const head = join(dir, 'HEAD');
     if (!existsSync(head)) writeFileSync(head, 'ref: refs/heads/main\n');
+  }
+
+  /** Drop every cached trace of one repository (its objects, refs, dirs). */
+  dropRepo(owner: string, repo: string): void {
+    const prefix = `${owner}/${repo}/`;
+    for (const key of [...this.objectCache.keys()]) {
+      if (key.startsWith(prefix)) this.objectCache.delete(key);
+    }
+    for (const key of [...this.parentCache.keys()]) {
+      if (key.startsWith(prefix)) this.parentCache.delete(key);
+    }
+    this.refCache.delete(`${owner}/${repo}`);
+    this.refsLoaded.delete(`${owner}/${repo}`);
+    this.ensuredRepos.delete(`${owner}/${repo}`);
+    for (const dir of [...this.objectDirs]) {
+      if (dir.startsWith(join(this.gitDir(owner, repo), 'objects'))) this.objectDirs.delete(dir);
+    }
+    this.refsGeneration += 1;
   }
 
   objectPath(owner: string, repo: string, sha: string): string {
@@ -133,6 +192,8 @@ export class GitStore {
 
   hasObject(owner: string, repo: string, sha: string): boolean {
     if (!isSha(sha)) return false;
+    if (this.objectCache.has(`${owner}/${repo}/${sha}`)) return true;
+    if (!this.persist) return false;
     return existsSync(this.objectPath(owner, repo, sha));
   }
 
@@ -141,6 +202,7 @@ export class GitStore {
     const cacheKey = `${owner}/${repo}/${sha}`;
     const cached = this.objectCache.get(cacheKey);
     if (cached !== undefined) return cached;
+    if (!this.persist) return null;
     const path = this.objectPath(owner, repo, sha);
     if (!existsSync(path)) return null;
     try {
@@ -160,16 +222,40 @@ export class GitStore {
     }
   }
 
-  writeObject(owner: string, repo: string, type: ObjectType, body: Buffer): string {
-    const sha = hashObject(type, body);
-    const path = this.objectPath(owner, repo, sha);
-    if (!existsSync(path)) {
-      mkdirSync(dirname(path), { recursive: true });
-      const header = Buffer.from(`${type} ${body.length}\0`, 'ascii');
-      writeFileSync(path, deflateSync(Buffer.concat([header, body])));
+  /** A commit's parents, memoized: parse the body once, then Map lookups. */
+  commitParents(owner: string, repo: string, sha: string): string[] | null {
+    const cacheKey = `${owner}/${repo}/${sha}`;
+    const cached = this.parentCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+    const obj = this.readObject(owner, repo, sha);
+    if (obj === null || obj.type !== 'commit') return null;
+    const parents = parseCommitParents(obj.body);
+    if (this.parentCache.size >= 16384 && this.persist) this.parentCache.clear();
+    this.parentCache.set(cacheKey, parents);
+    return parents;
+  }
+
+  writeObject(owner: string, repo: string, type: ObjectType, body: Buffer, knownSha?: string): string {
+    const sha = knownSha ?? hashObject(type, body);
+    const cacheKey = `${owner}/${repo}/${sha}`;
+    if (this.objectCache.has(cacheKey)) return sha;
+    if (this.persist) {
+      const path = this.objectPath(owner, repo, sha);
+      if (!existsSync(path)) {
+        const dir = dirname(path);
+        if (!this.objectDirs.has(dir)) {
+          mkdirSync(dir, { recursive: true });
+          this.objectDirs.add(dir);
+        }
+        const header = Buffer.from(`${type} ${body.length}\0`, 'ascii');
+        // Level 1: the object bytes are identical at any level, and a 1 KiB
+        // blob deflates ~3x faster at level 1 than at the default level 6.
+        writeFileSync(path, deflateSync(Buffer.concat([header, body]), { level: 1 }));
+      }
     }
-    if (this.objectCache.size >= 8192) this.objectCache.clear();
-    this.objectCache.set(`${owner}/${repo}/${sha}`, { type, body: Buffer.from(body) });
+    if (this.objectCache.size >= 8192 && this.persist) this.objectCache.clear();
+    this.objectCache.set(cacheKey, { type, body: Buffer.from(body) });
+    if (type === 'commit') this.parentCache.set(cacheKey, parseCommitParents(body));
     return sha;
   }
 
@@ -180,38 +266,25 @@ export class GitStore {
   }
 
   getRef(owner: string, repo: string, ref: string): string | null {
-    const path = join(this.gitDir(owner, repo), this.normalizeRef(ref));
-    if (!existsSync(path)) return null;
-    try {
-      const text = readFileSync(path, 'utf8').trim();
-      return isSha(text) ? text : null;
-    } catch {
-      return null;
-    }
+    const fullRef = this.normalizeRef(ref);
+    const refs = this.refMap(owner, repo);
+    const cached = refs.get(fullRef);
+    return cached !== undefined ? cached : null;
   }
 
   getBranchTip(owner: string, repo: string, branch: string): string | null {
     return this.getRef(owner, repo, `refs/heads/${branch}`);
   }
 
-  /** Update a ref; refuses a non-fast-forward move unless force is set. */
-  updateRef(owner: string, repo: string, ref: string, sha: string, opts: { force?: boolean } = {}): boolean {
-    if (!isSha(sha)) return false;
-    const fullRef = this.normalizeRef(ref);
-    const current = this.getRef(owner, repo, fullRef);
-    if (current !== null && current !== sha && opts.force !== true) {
-      if (!this.isAncestor(owner, repo, current, sha)) return false;
-    }
-    const path = join(this.gitDir(owner, repo), fullRef);
-    mkdirSync(dirname(path), { recursive: true });
-    const tmp = `${path}.tmp`;
-    writeFileSync(tmp, `${sha}\n`);
-    renameSync(tmp, path);
-    return true;
-  }
-
-  listRefs(owner: string, repo: string): { ref: string; sha: string }[] {
-    const out: { ref: string; sha: string }[] = [];
+  /** The repo's ref map, loaded once (from disk when persisting). */
+  refMap(owner: string, repo: string): Map<string, string> {
+    const key = `${owner}/${repo}`;
+    let refs = this.refCache.get(key);
+    if (refs !== undefined) return refs;
+    refs = new Map<string, string>();
+    this.refCache.set(key, refs);
+    this.refsLoaded.add(key);
+    if (!this.persist) return refs;
     const refsRoot = join(this.gitDir(owner, repo), 'refs');
     const walk = (dir: string, prefix: string): void => {
       if (!existsSync(dir)) return;
@@ -221,7 +294,7 @@ export class GitStore {
         else if (entry.isFile()) {
           try {
             const text = readFileSync(child, 'utf8').trim();
-            if (isSha(text)) out.push({ ref: `refs/${prefix}${entry.name}`, sha: text });
+            if (isSha(text)) refs.set(`refs/${prefix}${entry.name}`, text);
           } catch {
             // Unreadable ref file: skip it.
           }
@@ -229,6 +302,47 @@ export class GitStore {
       }
     };
     walk(refsRoot, '');
+    return refs;
+  }
+
+  /** Update a ref; refuses a non-fast-forward move unless force is set. */
+  updateRef(owner: string, repo: string, ref: string, sha: string, opts: { force?: boolean } = {}): boolean {
+    if (!isSha(sha)) return false;
+    const fullRef = this.normalizeRef(ref);
+    const refs = this.refMap(owner, repo);
+    const current = refs.get(fullRef) ?? null;
+    if (current !== null && current !== sha && opts.force !== true) {
+      if (!this.isAncestor(owner, repo, current, sha)) return false;
+    }
+    refs.set(fullRef, sha);
+    this.refsGeneration += 1;
+    if (this.persist) {
+      const path = join(this.gitDir(owner, repo), fullRef);
+      mkdirSync(dirname(path), { recursive: true });
+      const tmp = `${path}.tmp`;
+      writeFileSync(tmp, `${sha}\n`);
+      renameSync(tmp, path);
+    }
+    return true;
+  }
+
+  /** Delete a ref (both the cache and, when persisting, the ref file). */
+  deleteRef(owner: string, repo: string, ref: string): void {
+    const fullRef = this.normalizeRef(ref);
+    this.refMap(owner, repo).delete(fullRef);
+    this.refsGeneration += 1;
+    if (this.persist) {
+      try {
+        unlinkSync(join(this.gitDir(owner, repo), fullRef));
+      } catch {
+        // Already gone: the ref is deleted either way.
+      }
+    }
+  }
+
+  listRefs(owner: string, repo: string): { ref: string; sha: string }[] {
+    const out: { ref: string; sha: string }[] = [];
+    for (const [ref, sha] of this.refMap(owner, repo)) out.push({ ref, sha });
     out.sort((a, b) => (a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0));
     return out;
   }
@@ -285,6 +399,9 @@ export class GitStore {
 
   isAncestor(owner: string, repo: string, ancestor: string, descendant: string): boolean {
     if (ancestor === descendant) return true;
+    // Fast path: the common push shape — one new commit directly on the old tip.
+    const direct = this.commitParents(owner, repo, descendant);
+    if (direct !== null && direct.includes(ancestor)) return true;
     const seen = new Set<string>();
     const stack: string[] = [descendant];
     while (stack.length > 0) {
@@ -292,9 +409,9 @@ export class GitStore {
       if (seen.has(sha)) continue;
       seen.add(sha);
       if (sha === ancestor) return true;
-      const commit = this.readCommit(owner, repo, sha);
-      if (commit === null) continue;
-      for (const parent of commit.parents) stack.push(parent);
+      const parents = this.commitParents(owner, repo, sha);
+      if (parents === null) continue;
+      for (const parent of parents) stack.push(parent);
     }
     return false;
   }

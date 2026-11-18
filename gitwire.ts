@@ -30,9 +30,7 @@
 //
 // Only Node built-ins are used.
 
-import { unlinkSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { join } from 'node:path';
 import {
   encodeDelim,
   encodeFlush,
@@ -69,6 +67,16 @@ const RECEIVE_V0_CAPS =
 /** A bounded cache of generated packs: the clone workload re-clones one tip. */
 const PACK_CACHE_MAX = 8;
 const packCache = new Map<string, Buffer>();
+/**
+ * A bounded cache of fetch selections (the object walk selectFetch does):
+ * the clone workload re-clones one tip fifty times a round, and the
+ * selection is a pure function of (wants, haves, shallow, depth) over
+ * immutable objects — only ref changes (tags, for include-tag) can move
+ * it, so the key carries the store's refs generation. The include-tag
+ * extra-tags step is NOT cached: it reads the live refs every time.
+ */
+const SELECTION_CACHE_MAX = 8;
+const selectionCache = new Map<string, FetchSelection>();
 
 class HttpError extends Error {
   readonly status: number;
@@ -175,14 +183,9 @@ function mainSha(rc: RepoCtx): string | null {
   return sha !== null && sha !== ZERO_OID ? sha : null;
 }
 
-/** Delete a ref. GitStore has no delete, so remove the ref file itself. */
+/** Delete a ref, through the store so its ref cache stays coherent. */
 function deleteRef(rc: RepoCtx, name: string): void {
-  const path = join(rc.ctx.dataDir, rc.owner, `${rc.repo}.git`, name);
-  try {
-    unlinkSync(path);
-  } catch {
-    // Already gone: the ref is deleted either way.
-  }
+  rc.git.deleteRef(rc.owner, rc.repo, name);
 }
 
 // --------------------------------------------------------------------------------------------
@@ -267,6 +270,10 @@ function resolveToCommit(rc: RepoCtx, oid: string): string | null {
 
 /** True when `ancestor` is `descendant` or one of its commit parents. */
 function isAncestorOrEqual(rc: RepoCtx, ancestor: string, descendant: string): boolean {
+  if (ancestor === descendant) return true;
+  // Fast path: the common push shape — one new commit directly on the old tip.
+  const direct = rc.git.commitParents(rc.owner, rc.repo, descendant);
+  if (direct !== null && direct.includes(ancestor)) return true;
   const seen = new Set<string>();
   const stack: string[] = [descendant];
   while (stack.length) {
@@ -274,14 +281,17 @@ function isAncestorOrEqual(rc: RepoCtx, ancestor: string, descendant: string): b
     if (oid === ancestor) return true;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const object = readStored(rc, oid);
-    if (!object) continue;
-    if (object.type === 'commit') {
-      for (const parent of parseCommit(object.body).parents) stack.push(parent);
-    } else if (object.type === 'tag') {
-      const target = parseTagTarget(object.body);
-      if (target) stack.push(target.object);
+    const parents = rc.git.commitParents(rc.owner, rc.repo, oid);
+    if (parents === null) {
+      // A tag on the path: follow it to its target.
+      const object = readStored(rc, oid);
+      if (object && object.type === 'tag') {
+        const target = parseTagTarget(object.body);
+        if (target) stack.push(target.object);
+      }
+      continue;
     }
+    for (const parent of parents) stack.push(parent);
   }
   return false;
 }
@@ -469,6 +479,49 @@ function selectFetch(
   return { objects, shallow, unshallow, ack, acks };
 }
 
+/** The cache key for one fetch's pack and selection (same inputs, both). */
+function fetchCacheKey(
+  rc: RepoCtx,
+  wants: string[],
+  haves: string[],
+  shallowIn: string[],
+  depth: number | undefined,
+  includeTag: boolean,
+): string {
+  return [
+    rc.owner,
+    rc.repo,
+    wants.join(','),
+    `depth=${depth ?? ''}`,
+    [...haves].sort().join(','),
+    [...shallowIn].sort().join(','),
+    `include-tag=${includeTag ? '1' : '0'}`,
+    `refsgen=${rc.git.refsGeneration}`,
+  ].join('|');
+}
+
+/** selectFetch, memoized: the same fetch repeats fifty times a clone round. */
+function cachedSelectFetch(
+  rc: RepoCtx,
+  wants: string[],
+  haves: string[],
+  shallowIn: string[],
+  depth: number | undefined,
+  includeTag: boolean,
+): FetchSelection {
+  const key = fetchCacheKey(rc, wants, haves, shallowIn, depth, includeTag);
+  const hit = selectionCache.get(key);
+  if (hit !== undefined) return hit;
+  const selection = selectFetch(rc, wants, haves, shallowIn, depth);
+  selectionCache.set(key, selection);
+  while (selectionCache.size > SELECTION_CACHE_MAX) {
+    const oldest = selectionCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    selectionCache.delete(oldest);
+  }
+  return selection;
+}
+
 function packForFetch(
   rc: RepoCtx,
   wants: string[],
@@ -478,15 +531,7 @@ function packForFetch(
   selection: FetchSelection,
   includeTag: boolean,
 ): Buffer {
-  const key = [
-    rc.owner,
-    rc.repo,
-    wants.join(','),
-    `depth=${depth ?? ''}`,
-    [...haves].sort().join(','),
-    [...shallowIn].sort().join(','),
-    `include-tag=${includeTag ? '1' : '0'}`,
-  ].join('|');
+  const key = fetchCacheKey(rc, wants, haves, shallowIn, depth, includeTag);
   const hit = packCache.get(key);
   if (hit) return hit;
   const pack = writePack(selection.objects);
@@ -771,7 +816,7 @@ function fetchV2Response(rc: RepoCtx, args: FetchArgs, res: ServerResponse): voi
     }
   }
   const depth = resolveDepth(rc, args);
-  let selection = selectFetch(rc, args.wants, args.haves, args.shallow, depth);
+  let selection = cachedSelectFetch(rc, args.wants, args.haves, args.shallow, depth, args.includeTag);
   if (args.includeTag) {
     // Also send annotated tags pointing at a delivered commit.
     const delivered = new Set(selection.objects.map((object) => object.sha));
@@ -839,7 +884,7 @@ function fetchV0Response(rc: RepoCtx, args: FetchArgs, res: ServerResponse): voi
     }
   }
   const depth = resolveDepth(rc, args);
-  const selection = selectFetch(rc, args.wants, args.haves, args.shallow, depth);
+  const selection = cachedSelectFetch(rc, args.wants, args.haves, args.shallow, depth, args.includeTag);
   const pack = args.wants.length
     ? packForFetch(rc, args.wants, args.haves, args.shallow, depth, selection, args.includeTag)
     : emptyPack();
@@ -1028,7 +1073,9 @@ export function handleReceivePack(
           (sha: string) => readStored(rc, sha),
         );
         for (const object of objects) {
-          rc.git.writeObject(owner, repo, object.type, object.body);
+          // parsePack already hashed each object: pass the sha through so
+          // writeObject does not hash it a second time.
+          rc.git.writeObject(owner, repo, object.type, object.body, object.sha);
         }
       } catch (err) {
         unpackOk = false;
