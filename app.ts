@@ -21,12 +21,35 @@ import { Store } from './store.ts';
 const JSON_TYPE = 'application/json; charset=utf-8';
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
   });
-  res.end(text);
+  res.end(buf);
+}
+
+/**
+ * Split a request target into pathname + raw query without the URL
+ * parser: the bench's 2,000-read rounds pay a full URL parse per GET.
+ * Only plain paths take the fast path; anything with percent-encoding,
+ * backslashes, empty segments or dot segments falls back to `new URL`
+ * so routing and decoding behave exactly as before.
+ */
+function parseRequestTarget(rawUrl: string): { pathname: string; search: string } | null {
+  const qIndex = rawUrl.indexOf('?');
+  const pathname = qIndex < 0 ? rawUrl : rawUrl.slice(0, qIndex);
+  const search = qIndex < 0 ? '' : rawUrl.slice(qIndex + 1);
+  if (
+    pathname.includes('%') ||
+    pathname.includes('\\') ||
+    pathname.includes('//') ||
+    /(^|\/)\.(?:\/|$)/.test(pathname) ||
+    /(^|\/)\.\.(?:\/|$)/.test(pathname)
+  ) {
+    return null;
+  }
+  return { pathname, search };
 }
 
 function decodeSegment(segment: string): string | null {
@@ -99,14 +122,24 @@ async function handleRequest(
 ): Promise<void> {
   res.setHeader('x-github-request-id', nextRequestId());
   const method = req.method ?? 'GET';
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://forge');
-  } catch {
-    sendJson(res, 404, { message: 'Not Found' });
-    return;
+  const rawUrl = req.url ?? '/';
+  const fast = parseRequestTarget(rawUrl);
+  let pathname: string;
+  let searchParams: URLSearchParams;
+  if (fast !== null) {
+    pathname = fast.pathname;
+    searchParams = new URLSearchParams(fast.search);
+  } else {
+    let url: URL;
+    try {
+      url = new URL(rawUrl, 'http://forge');
+    } catch {
+      sendJson(res, 404, { message: 'Not Found' });
+      return;
+    }
+    pathname = url.pathname;
+    searchParams = url.searchParams;
   }
-  const pathname = url.pathname;
 
   if (method === 'GET' && pathname === '/healthz') {
     sendJson(res, 200, { ok: true });
@@ -165,7 +198,7 @@ async function handleRequest(
     const restReq: RestRequest = {
       method,
       segments,
-      query: url.searchParams,
+      query: searchParams,
       body: parsedBody,
       origin,
       pathname,
@@ -178,7 +211,7 @@ async function handleRequest(
   // Git smart HTTP: /<owner>/<repo>[.git]/info/refs, git-upload-pack, git-receive-pack.
   const gitMatch = /^\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(pathname);
   if (gitMatch !== null) {
-    const service = url.searchParams.get('service') ?? '';
+    const service = searchParams.get('service') ?? '';
     if (gitMatch[3] === 'info/refs') {
       if (service !== '' && service !== 'git-upload-pack' && service !== 'git-receive-pack') {
         sendJson(res, 400, { message: `unknown service ${service}` });

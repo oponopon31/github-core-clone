@@ -36,14 +36,14 @@ function isRecord(value: unknown): value is JsonRecord {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
-  const text = status === 204 ? '' : `${JSON.stringify(body)}\n`;
+  const buf = status === 204 ? Buffer.alloc(0) : Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   const headers: Record<string, string> = { ...extra };
   if (status !== 204) {
     headers['content-type'] = 'application/json; charset=utf-8';
-    headers['content-length'] = String(Buffer.byteLength(text));
+    headers['content-length'] = String(buf.length);
   }
   res.writeHead(status, headers);
-  res.end(text);
+  res.end(buf);
 }
 
 function sendError(res: ServerResponse, status: number, message: string): void {

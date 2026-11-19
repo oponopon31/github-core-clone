@@ -77,6 +77,25 @@ const packCache = new Map<string, Buffer>();
  */
 const SELECTION_CACHE_MAX = 8;
 const selectionCache = new Map<string, FetchSelection>();
+/**
+ * A bounded cache of fully assembled wire responses (fetch, ls-refs, v0
+ * advertisement): the clone workload repeats the same three requests fifty
+ * times a round, and each response is a pure function of the request args
+ * over immutable objects plus the refs generation — the same key the pack
+ * and selection caches already carry, so a ref mutation invalidates it.
+ * A cached Buffer is never mutated (res.end only reads it), so sharing it
+ * across concurrent responses is safe.
+ */
+const RESPONSE_CACHE_MAX = 8;
+const responseCache = new Map<string, Buffer>();
+function responseCacheSet(key: string, body: Buffer): void {
+  responseCache.set(key, body);
+  while (responseCache.size > RESPONSE_CACHE_MAX) {
+    const oldest = responseCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    responseCache.delete(oldest);
+  }
+}
 
 class HttpError extends Error {
   readonly status: number;
@@ -99,9 +118,9 @@ interface RepoCtx {
 // --------------------------------------------------------------------------------------------
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text) });
-  res.end(text);
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length });
+  res.end(buf);
 }
 
 function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
@@ -577,6 +596,9 @@ function requireOid(value: string, what: string): string {
 // --------------------------------------------------------------------------------------------
 
 function v0Advertisement(rc: RepoCtx, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cacheKey = `${rc.owner}|${rc.repo}|${service}|refsgen=${rc.git.refsGeneration}`;
+  const hit = responseCache.get(cacheKey);
+  if (hit) return hit;
   const caps = service === 'git-upload-pack' ? UPLOAD_V0_CAPS : RECEIVE_V0_CAPS;
   const refs = sortedRefs(rc);
   const refLines: string[] = [];
@@ -595,18 +617,23 @@ function v0Advertisement(rc: RepoCtx, service: 'git-upload-pack' | 'git-receive-
   const parts: Buffer[] = [encodePktLine(`# service=${service}\n`), encodeFlush()];
   for (const line of refLines) parts.push(encodePktLine(`${line}\n`));
   parts.push(encodeFlush());
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  responseCacheSet(cacheKey, body);
+  return body;
 }
 
+/** The v2 advertisement never changes: build it once, not per request. */
+const V2_ADVERTISEMENT: Buffer = encodePktLines([
+  'version 2\n',
+  'fetch=shallow filter\n',
+  'ls-refs=unborn\n',
+  'object-format=sha1\n',
+  `agent=${GIT_AGENT}\n`,
+  'flush',
+]);
+
 function v2Advertisement(): Buffer {
-  return encodePktLines([
-    'version 2\n',
-    'fetch=shallow filter\n',
-    'ls-refs=unborn\n',
-    'object-format=sha1\n',
-    `agent=${GIT_AGENT}\n`,
-    'flush',
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 /**
@@ -716,6 +743,19 @@ function lsRefsResponse(rc: RepoCtx, lines: readonly string[], res: ServerRespon
     // unborn, agent, object-format: accepted, no extra work (unborn refs
     // are always reported when they exist).
   }
+  const cacheKey = [
+    rc.owner,
+    rc.repo,
+    `peel=${peel ? '1' : '0'}`,
+    `symrefs=${symrefs ? '1' : '0'}`,
+    `prefixes=${prefixes.join(',')}`,
+    `refsgen=${rc.git.refsGeneration}`,
+  ].join('|');
+  const hit = responseCache.get(cacheKey);
+  if (hit) {
+    sendBuffer(res, 200, UPLOAD_RESULT, hit);
+    return;
+  }
   const refs = sortedRefs(rc);
   const main = mainSha(rc);
   interface OutRef {
@@ -764,7 +804,9 @@ function lsRefsResponse(rc: RepoCtx, lines: readonly string[], res: ServerRespon
     parts.push(encodePktLine(`${line}\n`));
   }
   parts.push(encodeFlush());
-  sendBuffer(res, 200, UPLOAD_RESULT, Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  responseCacheSet(cacheKey, body);
+  sendBuffer(res, 200, UPLOAD_RESULT, body);
 }
 
 /**
@@ -816,6 +858,12 @@ function fetchV2Response(rc: RepoCtx, args: FetchArgs, res: ServerResponse): voi
     }
   }
   const depth = resolveDepth(rc, args);
+  const cacheKey = `${fetchCacheKey(rc, args.wants, args.haves, args.shallow, depth, args.includeTag)}|done=${args.done ? '1' : '0'}`;
+  const hit = responseCache.get(cacheKey);
+  if (hit) {
+    sendBuffer(res, 200, UPLOAD_RESULT, hit);
+    return;
+  }
   let selection = cachedSelectFetch(rc, args.wants, args.haves, args.shallow, depth, args.includeTag);
   if (args.includeTag) {
     // Also send annotated tags pointing at a delivered commit.
@@ -874,7 +922,9 @@ function fetchV2Response(rc: RepoCtx, args: FetchArgs, res: ServerResponse): voi
   parts.push(encodePktLine('packfile\n'));
   parts.push(encodeSideband(1, pack));
   parts.push(encodeFlush());
-  sendBuffer(res, 200, UPLOAD_RESULT, Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  responseCacheSet(cacheKey, body);
+  sendBuffer(res, 200, UPLOAD_RESULT, body);
 }
 
 function fetchV0Response(rc: RepoCtx, args: FetchArgs, res: ServerResponse): void {
@@ -884,6 +934,12 @@ function fetchV0Response(rc: RepoCtx, args: FetchArgs, res: ServerResponse): voi
     }
   }
   const depth = resolveDepth(rc, args);
+  const cacheKey = fetchCacheKey(rc, args.wants, args.haves, args.shallow, depth, args.includeTag);
+  const hit = responseCache.get(cacheKey);
+  if (hit) {
+    sendBuffer(res, 200, UPLOAD_RESULT, hit);
+    return;
+  }
   const selection = cachedSelectFetch(rc, args.wants, args.haves, args.shallow, depth, args.includeTag);
   const pack = args.wants.length
     ? packForFetch(rc, args.wants, args.haves, args.shallow, depth, selection, args.includeTag)
@@ -894,7 +950,9 @@ function fetchV0Response(rc: RepoCtx, args: FetchArgs, res: ServerResponse): voi
   for (const sha of selection.unshallow) parts.push(encodePktLine(`unshallow ${sha}\n`));
   parts.push(encodeSideband(1, pack));
   parts.push(encodeFlush());
-  sendBuffer(res, 200, UPLOAD_RESULT, Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  responseCacheSet(cacheKey, body);
+  sendBuffer(res, 200, UPLOAD_RESULT, body);
 }
 
 /**
@@ -1069,7 +1127,7 @@ export function handleReceivePack(
     if (pack.length > 0) {
       try {
         const objects = parsePack(
-          Buffer.from(pack),
+          pack,
           (sha: string) => readStored(rc, sha),
         );
         for (const object of objects) {
