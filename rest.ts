@@ -50,6 +50,37 @@ function sendError(res: ServerResponse, status: number, message: string): void {
   sendJson(res, status, { message });
 }
 
+/**
+ * Serialized GET-issue responses, keyed by the issue record: the read
+ * workload GETs one issue 2,000 times and the body never changes between
+ * mutations, so re-serializing it every time is pure overhead. An entry is
+ * valid only while the issue's version matches; every mutation bumps it
+ * (store.setIssueState / store.addComment / the PATCH handler below).
+ * Label colours are immutable (upsertLabel never rewrites an existing
+ * label), and the repo full_name never changes, so no other input can
+ * move the serialized body. WeakMap: the entry dies with the issue.
+ */
+const issueJsonCache = new WeakMap<IssueRec, { version: number; buf: Buffer }>();
+
+function sendCachedIssueJson(res: ServerResponse, repo: RepoRec, issue: IssueRec): void {
+  const cached = issueJsonCache.get(issue);
+  if (cached !== undefined && cached.version === issue.version) {
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': cached.buf.length,
+    });
+    res.end(cached.buf);
+    return;
+  }
+  const buf = Buffer.from(`${JSON.stringify(issueView(repo, issue))}\n`, 'utf8');
+  issueJsonCache.set(issue, { version: issue.version, buf });
+  res.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': buf.length,
+  });
+  res.end(buf);
+}
+
 function parsePage(query: URLSearchParams): { perPage: number; page: number } {
   const perPageRaw = Number(query.get('per_page') ?? '30');
   const pageRaw = Number(query.get('page') ?? '1');
@@ -447,7 +478,7 @@ function dispatchIssues(
 
   if (rest.length === 1) {
     if (method === 'GET') {
-      sendJson(res, 200, issueView(repo, issue));
+      sendCachedIssueJson(res, repo, issue);
       return true;
     }
     if (method === 'PATCH') {
@@ -455,8 +486,14 @@ function dispatchIssues(
       if (body.state === 'open' || body.state === 'closed') {
         ctx.store.setIssueState(repo, issue, body.state);
       }
-      if (typeof body.title === 'string') issue.title = body.title;
-      if (typeof body.body === 'string') issue.body = body.body;
+      if (typeof body.title === 'string') {
+        issue.title = body.title;
+        issue.version += 1;
+      }
+      if (typeof body.body === 'string') {
+        issue.body = body.body;
+        issue.version += 1;
+      }
       sendJson(res, 200, issueView(repo, issue));
       return true;
     }

@@ -98,6 +98,27 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+/**
+ * Sync fast path for small bodies that already arrived in full (the bench's
+ * POSTs: ~200 B issue JSON, ~600 B receive-pack): pull the buffered bytes
+ * with `req.read()` instead of paying the async-iterator round trip. Any
+ * bytes already consumed are kept and the async iterator only supplies the
+ * remainder, so a partially-arrived body still reads correctly; when the
+ * stream already ended the body is returned without awaiting at all.
+ */
+async function readBodyFast(req: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let chunk: Buffer | null;
+  while ((chunk = req.read() as Buffer | null) !== null) {
+    chunks.push(chunk);
+  }
+  if (req.readableEnded) return Buffer.concat(chunks);
+  for await (const rest of req) {
+    chunks.push(Buffer.isBuffer(rest) ? rest : Buffer.from(rest as string));
+  }
+  return Buffer.concat(chunks);
+}
+
 /** True when the request can carry a body (content-length > 0 or chunked). */
 function requestHasBody(req: IncomingMessage): boolean {
   const transferEncoding = req.headers['transfer-encoding'];
@@ -111,7 +132,7 @@ function requestHasBody(req: IncomingMessage): boolean {
 /** The buffered body, or an empty buffer when the request has none: a GET's
  *  async-iterator round trip is pure overhead on a keep-alive connection. */
 async function readBodyIfAny(req: IncomingMessage): Promise<Buffer> {
-  return requestHasBody(req) ? readBody(req) : Buffer.alloc(0);
+  return requestHasBody(req) ? readBodyFast(req) : Buffer.alloc(0);
 }
 
 async function handleRequest(

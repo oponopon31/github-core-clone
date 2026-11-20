@@ -42,6 +42,9 @@ export interface IssueRec {
   createdSeq: number;
   updatedSeq: number;
   comments: CommentRec[];
+  /** Bumped on every mutation (state, title, body, comment): the serialized
+   *  GET-issue cache in rest.ts is valid only while this matches. */
+  version: number;
 }
 
 export interface PrRec {
@@ -215,6 +218,7 @@ export class Store {
       createdSeq: order,
       updatedSeq: order,
       comments: [],
+      version: 1,
     };
     repo.nextIssueNumber += 1;
     repo.issues.set(issue.number, issue);
@@ -227,6 +231,7 @@ export class Store {
     issue.state = state;
     issue.updated_at = this.clock.tickIso();
     issue.updatedSeq = this.nextOrder();
+    issue.version += 1;
     this.saveSnapshot();
     return issue;
   }
@@ -241,6 +246,7 @@ export class Store {
       created_at: this.clock.tickIso(),
     };
     issue.comments.push(comment);
+    issue.version += 1;
     this.commentsByNodeId.set(comment.nodeId, { repo, issue, comment });
     this.saveSnapshot();
     return comment;
